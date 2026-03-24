@@ -26,7 +26,6 @@ def serve_command(args):
 
     # Import unified server
     from . import server
-    from .scheduler import SchedulerConfig
     from .server import RateLimiter, app, load_model
 
     logger = logging.getLogger(__name__)
@@ -108,6 +107,10 @@ def serve_command(args):
         print("  Metrics: ENABLED (/metrics, unauthenticated)")
     else:
         print("  Metrics: DISABLED - Use --enable-metrics to expose /metrics")
+    if args.auto_unload_idle_seconds > 0:
+        print(f"  Idle auto-unload: ENABLED ({args.auto_unload_idle_seconds:.0f}s)")
+    else:
+        print("  Idle auto-unload: DISABLED")
     if args.enable_auto_tool_choice:
         print(f"  Tool calling: ENABLED (parser: {args.tool_call_parser})")
     else:
@@ -133,7 +136,11 @@ def serve_command(args):
         is_mllm=is_mllm_model(args.model),
     )
 
-    print(f"Loading model: {args.model}")
+    if args.lazy_load_model:
+        print(f"Registering model for lazy load: {args.model}")
+        print("Model will load on the first request.")
+    else:
+        print(f"Loading model: {args.model}")
     print(f"Default max tokens: {args.max_tokens}")
 
     # Store MCP config path for FastAPI startup
@@ -150,6 +157,8 @@ def serve_command(args):
     # Build scheduler config for batched mode
     scheduler_config = None
     if args.continuous_batching:
+        from .scheduler import SchedulerConfig
+
         # Handle prefix cache flags
         enable_prefix_cache = args.enable_prefix_cache and not args.disable_prefix_cache
 
@@ -236,6 +245,8 @@ def serve_command(args):
         specprefill_threshold=args.specprefill_threshold,
         specprefill_keep_pct=args.specprefill_keep_pct,
         specprefill_draft_model=args.specprefill_draft_model,
+        auto_unload_idle_seconds=args.auto_unload_idle_seconds,
+        lazy_load_model=args.lazy_load_model,
     )
 
     # Start server
@@ -884,6 +895,17 @@ Examples:
         "--enable-metrics",
         action="store_true",
         help="Expose Prometheus metrics on /metrics (disabled by default)",
+    )
+    serve_parser.add_argument(
+        "--auto-unload-idle-seconds",
+        type=float,
+        default=0.0,
+        help="Unload the main model after this many idle seconds (0 = disabled)",
+    )
+    serve_parser.add_argument(
+        "--lazy-load-model",
+        action="store_true",
+        help="Register the main model at startup but defer loading until first request",
     )
     # Tool calling options
     serve_parser.add_argument(
