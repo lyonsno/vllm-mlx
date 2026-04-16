@@ -1890,29 +1890,32 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     )
     if engine is None:
         return Response(status_code=499)
+    release_on_exit = True
 
-    if request.stream:
-        return StreamingResponse(
-            _disconnect_guard(
-                stream_completion(
-                    engine,
-                    prompts[0],
-                    request,
-                    repetition_penalty=comp_rep_penalty,
-                    metrics_tracker=tracker,
-                ),
-                raw_request,
-                cleanup=_release_default_engine,
-            ),
-            media_type="text/event-stream",
-        )
-
-    # Non-streaming response with timing and timeout
-    start_time = time.perf_counter()
-    choices = []
-    total_completion_tokens = 0
-    total_prompt_tokens = 0
     try:
+        if request.stream:
+            response = StreamingResponse(
+                _disconnect_guard(
+                    stream_completion(
+                        engine,
+                        prompts[0],
+                        request,
+                        repetition_penalty=comp_rep_penalty,
+                        metrics_tracker=tracker,
+                    ),
+                    raw_request,
+                    cleanup=_release_default_engine,
+                ),
+                media_type="text/event-stream",
+            )
+            release_on_exit = False
+            return response
+
+        # Non-streaming response with timing and timeout
+        start_time = time.perf_counter()
+        choices = []
+        total_completion_tokens = 0
+        total_prompt_tokens = 0
         for i, prompt in enumerate(prompts):
             generate_kwargs = {
                 "prompt": prompt,
@@ -1982,7 +1985,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             ),
         )
     finally:
-        await _release_default_engine()
+        if release_on_exit:
+            await _release_default_engine()
 
 
 @app.post(
