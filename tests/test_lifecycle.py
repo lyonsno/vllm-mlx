@@ -2258,7 +2258,7 @@ class TestCompletionStreamingRelease:
 
 
 class TestStatusEndpointEngineRace:
-    """Verify status/health endpoints handle concurrent engine unload."""
+    """Verify status/health endpoints handle engine being None."""
 
     @pytest.mark.asyncio
     async def test_status_endpoint_returns_not_loaded_when_engine_is_none(self, monkeypatch):
@@ -2321,7 +2321,7 @@ class TestStatusEndpointEngineRace:
 
 
 class TestToolParserUsesLocalEngine:
-    """Tool parser should use the request-local engine, not the global."""
+    """Tool parser should not crash when the global engine is None."""
 
     @pytest.mark.asyncio
     async def test_parse_tool_calls_survives_none_global_engine(self, monkeypatch):
