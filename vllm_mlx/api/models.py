@@ -12,7 +12,7 @@ These models define the request and response schemas for:
 import re
 import time
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, Field, model_serializer, model_validator
 
@@ -573,3 +573,38 @@ class ChatCompletionChunk(BaseModel):
     model: str
     choices: list[ChatCompletionChunkChoice]
     usage: Usage | None = None  # Included when stream_options.include_usage=true
+
+
+# =============================================================================
+# Vision: Hand Pose (optional, requires wilor-mlx)
+# =============================================================================
+
+
+_MAX_HAND_POSE_IMAGE_LENGTH = 30 * 1024 * 1024  # 30 MB base64, matches MLLM cap
+
+
+class HandPoseRequest(BaseModel):
+    """Request for hand pose estimation."""
+
+    image: str = Field(max_length=_MAX_HAND_POSE_IMAGE_LENGTH)
+    include_3d: bool = False
+    include_vertices: bool = False
+
+
+class HandPoseResult(BaseModel):
+    """A single detected hand's pose data."""
+
+    hand_side: Literal["left", "right"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    bbox: list[float]  # [x1, y1, x2, y2] in pixel coords
+    keypoints_2d: list[list[float]]  # 21 keypoints, each [x, y]
+    keypoints_3d: list[list[float]] | None = None  # 21 keypoints, each [x, y, z]
+    vertices: list[list[float]] | None = None  # MANO mesh vertices
+
+
+class HandPoseResponse(BaseModel):
+    """Response from hand pose estimation."""
+
+    hands: list[HandPoseResult]
+    backend: str
+    model: str

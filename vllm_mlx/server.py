@@ -88,6 +88,9 @@ from .api.models import (
     EmbeddingUsage,
     FunctionCall,
     GenerationMetadata,
+    HandPoseRequest,
+    HandPoseResponse,
+    HandPoseResult,
     ImageUrl,  # noqa: F401
     MCPExecuteRequest,
     MCPExecuteResponse,
@@ -4104,6 +4107,87 @@ async def list_voices(model: str = "kokoro"):
         return {"voices": CHATTERBOX_VOICES}
     else:
         return {"voices": ["default"]}
+
+
+# =============================================================================
+# Vision Endpoints (optional typed vision models)
+# =============================================================================
+
+# Global hand pose engine (lazy loaded)
+_hand_pose_engine = None
+_hand_pose_engine_lock = asyncio.Lock()
+
+
+@app.post(
+    "/v1/vision/hand_pose",
+    dependencies=[Depends(verify_api_key)],
+)
+async def hand_pose(req: HandPoseRequest):
+    """
+    Estimate hand pose from an image.
+
+    Returns structured 2D/3D keypoints per detected hand.
+    Requires wilor-mlx to be installed.
+    """
+    global _hand_pose_engine
+    tracker = _metrics.track_inference("vision_hand_pose", stream=False)
+
+    try:
+        from .vision.hand_pose import HandPoseEngine  # lazy import
+
+        async with _hand_pose_engine_lock:
+            if _hand_pose_engine is None or not _hand_pose_engine._loaded:
+                engine = HandPoseEngine()
+                await asyncio.to_thread(engine.load)
+                _hand_pose_engine = engine
+            engine = _hand_pose_engine
+
+        results = await asyncio.to_thread(
+            engine.predict,
+            req.image,
+            include_3d=req.include_3d,
+            include_vertices=req.include_vertices,
+        )
+
+        hands = [
+            HandPoseResult(
+                hand_side=r.hand_side,
+                confidence=r.confidence,
+                bbox=r.bbox,
+                keypoints_2d=r.keypoints_2d,
+                keypoints_3d=r.keypoints_3d,
+                vertices=r.vertices,
+            )
+            for r in results
+        ]
+
+        resp = HandPoseResponse(
+            hands=hands,
+            backend=engine.backend_name,
+            model=engine.model_name,
+        )
+        tracker.finish(result="success")
+        return resp.model_dump()
+
+    except ImportError:
+        tracker.finish(result="error")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "wilor-mlx not installed. "
+                "Install with: pip install wilor-mlx"
+            ),
+        )
+    except HTTPException as exc:
+        tracker.finish(result=_metrics_result_from_status(exc.status_code))
+        raise
+    except Exception as e:
+        tracker.finish(result="error")
+        _log_and_raise_internal_error(
+            "Hand pose estimation failed",
+            e,
+            "Hand pose estimation failed",
+        )
 
 
 # =============================================================================

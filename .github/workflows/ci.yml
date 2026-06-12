@@ -155,6 +155,7 @@ jobs:
             tests/test_thinking_aware_processor.py \
             tests/test_tool_choice_forced.py \
             tests/test_tool_choice_none.py \
+            tests/test_hand_pose.py \
             -v --tb=short \
             -m "not slow" \
             -k "not Integration"
