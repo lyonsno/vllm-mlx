@@ -47,6 +47,7 @@ class TestHandPoseModels:
         assert req.image is not None
         assert req.include_3d is False
         assert req.include_vertices is False
+        assert req.include_faces is False
 
     def test_request_model_with_options(self):
         """Request with explicit 3D and vertices flags."""
@@ -79,7 +80,28 @@ class TestHandPoseModels:
         assert resp.hands[0].hand_side == "left"
         assert resp.hands[0].keypoints_3d is None
         assert resp.hands[0].vertices is None
+        assert resp.faces is None
         assert resp.backend == "wilor-mlx"
+
+    def test_response_model_with_faces(self):
+        """Faces at response level contains triangle indices."""
+        from vllm_mlx.api.models import HandPoseResponse, HandPoseResult
+
+        result = HandPoseResult(
+            hand_side="right",
+            bbox=[10.0, 20.0, 100.0, 150.0],
+            confidence=0.9,
+            keypoints_2d=[[0.1, 0.2]] * 21,
+        )
+        resp = HandPoseResponse(
+            hands=[result],
+            faces=[[0, 1, 2], [2, 3, 0]],
+            backend="wilor-mlx",
+            model="wilor/hand-pose",
+        )
+        assert resp.faces is not None
+        assert len(resp.faces) == 2
+        assert all(len(f) == 3 for f in resp.faces)
 
     def test_response_model_with_3d(self):
         """Response with 3D keypoints populated."""
@@ -165,6 +187,8 @@ class TestHandPoseModels:
         assert dumped["hands"][0]["keypoints_3d"] is None
         assert "vertices" in dumped["hands"][0]
         assert dumped["hands"][0]["vertices"] is None
+        assert "faces" in dumped
+        assert dumped["faces"] is None
 
 
 
@@ -231,10 +255,11 @@ class TestHandPoseEndpoint:
             body = resp.json()
             assert "wilor" in body["detail"].lower()
 
-    def _make_mock_engine(self, results):
+    def _make_mock_engine(self, results, faces=None):
         """Create a mock HandPoseEngine with string attributes."""
         engine = MagicMock()
         engine.predict.return_value = results
+        engine.get_faces.return_value = faces
         engine._loaded = True
         engine.backend_name = "wilor-mlx"
         engine.model_name = "wilor/hand-pose-v1"
@@ -267,6 +292,35 @@ class TestHandPoseEndpoint:
         assert "keypoints_2d" in hand
         assert hand.get("keypoints_3d") is None
         assert hand.get("vertices") is None
+        assert body.get("faces") is None
+
+    def test_include_faces_flag_forwarded(self, client):
+        """include_faces=True returns MANO triangle indices at response level."""
+        mock_result = SimpleNamespace(
+            hand_side="right",
+            bbox=[10.0, 20.0, 100.0, 150.0],
+            confidence=0.9,
+            keypoints_2d=[[0.1, 0.2]] * 21,
+            keypoints_3d=None,
+            vertices=None,
+        )
+        mock_faces = [[0, 1, 2], [2, 3, 0], [4, 5, 6]]
+        mock_engine = self._make_mock_engine([mock_result], faces=mock_faces)
+
+        with patch("vllm_mlx.server._hand_pose_engine", mock_engine):
+            resp = client.post(
+                "/v1/vision/hand_pose",
+                json={
+                    "image": "data:image/jpeg;base64,/9j/4AAQ",
+                    "include_faces": True,
+                },
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["faces"] is not None
+        assert len(body["faces"]) == 3
+        assert body["faces"][0] == [0, 1, 2]
+        mock_engine.get_faces.assert_called_once()
 
     def test_include_3d_flag_forwarded(self, client):
         """include_3d=True is forwarded to predict() and 3D keypoints appear."""
@@ -498,3 +552,11 @@ class TestRealInference:
         assert len(det.keypoints_3d) == 21
         assert det.vertices is not None
         assert len(det.vertices) == 778
+
+    def test_get_faces_returns_triangle_indices(self, engine):
+        """get_faces() returns MANO mesh triangle indices."""
+        faces = engine.get_faces()
+        assert faces is not None
+        assert len(faces) == 1538
+        assert all(len(f) == 3 for f in faces)
+        assert all(isinstance(f[0], int) for f in faces)

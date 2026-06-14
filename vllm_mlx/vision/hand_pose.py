@@ -64,6 +64,16 @@ class HandPoseEngine:
         self._loaded = True
         logger.info("HandPoseEngine loaded (backend=%s)", self.backend_name)
 
+    def get_faces(self) -> list[list[int]] | None:
+        """Return MANO triangle indices (1538, 3), or None if unavailable."""
+        if self._pipeline is None:
+            return None
+        faces = getattr(self._pipeline.model.mano, 'faces', None)
+        if faces is None:
+            return None
+        import numpy as np
+        return np.array(faces).tolist()
+
     def predict(
         self,
         image_data: str,

@@ -589,6 +589,7 @@ class HandPoseRequest(BaseModel):
     image: str = Field(max_length=_MAX_HAND_POSE_IMAGE_LENGTH)
     include_3d: bool = False
     include_vertices: bool = False
+    include_faces: bool = False
 
 
 class HandPoseResult(BaseModel):
@@ -606,5 +607,6 @@ class HandPoseResponse(BaseModel):
     """Response from hand pose estimation."""
 
     hands: list[HandPoseResult]
+    faces: list[list[int]] | None = None  # (1538, 3) MANO triangle indices
     backend: str
     model: str

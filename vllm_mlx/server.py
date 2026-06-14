@@ -4161,8 +4161,11 @@ async def hand_pose(req: HandPoseRequest):
             for r in results
         ]
 
+        faces = engine.get_faces() if req.include_faces else None
+
         resp = HandPoseResponse(
             hands=hands,
+            faces=faces,
             backend=engine.backend_name,
             model=engine.model_name,
         )
