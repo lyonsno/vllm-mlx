@@ -66,13 +66,16 @@ class HandPoseEngine:
 
     def get_faces(self) -> list[list[int]] | None:
         """Return MANO triangle indices (1538, 3), or None if unavailable."""
+        if hasattr(self, '_faces_cache'):
+            return self._faces_cache
         if self._pipeline is None:
             return None
-        faces = getattr(self._pipeline.model.mano, 'faces', None)
+        faces = getattr(self._pipeline.pose_model.mano, 'faces', None)
         if faces is None:
             return None
         import numpy as np
-        return np.array(faces).tolist()
+        self._faces_cache = np.array(faces).tolist()
+        return self._faces_cache
 
     def predict(
         self,
