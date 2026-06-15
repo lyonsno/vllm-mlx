@@ -179,10 +179,11 @@ class RealtimeHandler:
         session.audio_buffer = b""
 
         # Wait for any pending transcription of the *previous* user turn
-        # before adding a new turn — ensures history is populated
+        # before adding a new turn — ensures history is populated.
+        # First transcription may take longer (model loading).
         if session.pending_transcription and not session.pending_transcription.done():
             try:
-                await asyncio.wait_for(session.pending_transcription, timeout=3.0)
+                await asyncio.wait_for(session.pending_transcription, timeout=30.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 logger.warning("Transcription timed out, proceeding without it")
 
@@ -372,33 +373,35 @@ class RealtimeHandler:
 
         if parts:
             history = "\n".join(parts[-8:])  # last 4 turns max
-            return (
+            prompt = (
                 f"You are in a voice conversation. Here is what has been said:\n\n"
                 f"{history}\n\n"
                 f"Listen to what the user says next and continue the conversation."
             )
+            logger.info(f"Context prompt ({len(parts)} parts):\n{prompt}")
+            return prompt
+        logger.info("No conversation history — first turn")
         return "Listen to what the user says and respond."
 
     async def _transcribe_user_audio(self, session, audio_float, item_id):
-        """Transcribe user audio in background using Parakeet STT.
-
-        Runs after the response completes (or is barged in on).
-        Updates the conversation item with the transcript so the next
-        turn's context prompt has real text instead of "[user spoke via audio]".
-        """
+        """Transcribe user audio in background using Parakeet STT."""
         try:
+            logger.info(f"Starting transcription for {item_id} ({len(audio_float)/SAMPLE_RATE_IN:.1f}s audio)")
             transcript = await asyncio.to_thread(
                 self._transcribe_sync, audio_float
             )
             if transcript:
-                # Update the conversation item with the transcript
                 for item in session.conversation:
                     if item.get("id") == item_id:
                         item["content"].append({"type": "text", "text": transcript})
                         break
-                logger.info(f"Transcribed user audio: {transcript[:80]}")
+                logger.info(f"Transcribed [{item_id}]: \"{transcript}\"")
+            else:
+                logger.warning(f"Empty transcription for {item_id}")
         except Exception as e:
             logger.warning(f"Transcription failed (non-fatal): {e}")
+            import traceback
+            traceback.print_exc()
 
     def _transcribe_sync(self, audio_float):
         """Synchronous STT — writes temp WAV, runs Parakeet."""
