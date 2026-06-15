@@ -201,10 +201,23 @@ class RealtimeVoiceClient:
 
                 now = time.time()
 
-                # Run silero VAD on the 512-sample chunk
-                chunk_tensor = torch.from_numpy(chunk_flat).unsqueeze(0)
-                speech_prob = vad_model(chunk_tensor, SAMPLE_RATE_IN).item()
-                voice_detected = speech_prob > self.vad_threshold
+                # Echo suppression: silero VAD detects speech, but it
+                # can't distinguish YOUR speech from speaker output.
+                # Suppress during playback + cooldown.
+                audio_still_playing = False
+                if self.first_audio_write_time is not None and self.audio_samples_written > 0:
+                    playback_duration = self.audio_samples_written / SAMPLE_RATE_OUT
+                    elapsed = now - self.first_audio_write_time
+                    if elapsed < playback_duration + self.echo_cooldown:
+                        audio_still_playing = True
+
+                if audio_still_playing:
+                    voice_detected = False
+                else:
+                    # Run silero VAD on the 512-sample chunk
+                    chunk_tensor = torch.from_numpy(chunk_flat).unsqueeze(0)
+                    speech_prob = vad_model(chunk_tensor, SAMPLE_RATE_IN).item()
+                    voice_detected = speech_prob > self.vad_threshold
 
                 if voice_detected:
                     self.last_voice_time = now
