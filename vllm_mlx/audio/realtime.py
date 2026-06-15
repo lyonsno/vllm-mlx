@@ -302,17 +302,17 @@ class RealtimeHandler:
         # Bridge: TTS thread puts chunks into queue, async loop sends them
         chunk_queue = asyncio.Queue()
         _DONE = object()
+        loop = asyncio.get_running_loop()
 
         def _produce():
             try:
                 for chunk in self._tts_generate_streaming(session, text):
-                    asyncio.get_event_loop().call_soon_threadsafe(chunk_queue.put_nowait, chunk)
+                    loop.call_soon_threadsafe(chunk_queue.put_nowait, chunk)
             except Exception as e:
-                asyncio.get_event_loop().call_soon_threadsafe(chunk_queue.put_nowait, e)
+                loop.call_soon_threadsafe(chunk_queue.put_nowait, e)
             finally:
-                asyncio.get_event_loop().call_soon_threadsafe(chunk_queue.put_nowait, _DONE)
+                loop.call_soon_threadsafe(chunk_queue.put_nowait, _DONE)
 
-        loop = asyncio.get_event_loop()
         import threading
         producer = threading.Thread(target=_produce, daemon=True)
         producer.start()
