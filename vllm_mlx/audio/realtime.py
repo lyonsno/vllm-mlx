@@ -345,18 +345,18 @@ class RealtimeHandler:
         if parts:
             history = "\n".join(parts[-6:])  # last 3 turns max
             return (
-                f"Previous conversation:\n{history}\n\n"
-                f"Listen to the user's new audio message and respond naturally, "
-                f"taking the conversation history into account."
+                f"This is an ongoing voice conversation. Here is what has been said so far:\n"
+                f"{history}\n\n"
+                f"Now listen to the user's latest audio message and respond naturally. "
+                f"Continue the conversation — don't repeat greetings if you've already greeted them."
             )
-        return "Listen to this audio and respond naturally."
+        return "Listen to this audio and respond naturally in a conversational way."
 
     def _gemma4_generate_sync(self, session, audio_input):
         """Synchronous Gemma 4 generation in thread.
 
-        Two-pass approach for multi-turn:
-        1. Quick transcription pass to get what the user said
-        2. Response pass with conversation history including the transcript
+        Single pass with conversation history. After generation, stores the
+        assistant's response in conversation for multi-turn context.
         """
         from mlx_vlm.tools.gemma4_audio.core import load_model
         from mlx_vlm.tools.gemma4_audio.prompt import build_prompt
@@ -370,27 +370,6 @@ class RealtimeHandler:
         model = self._gemma4_model
         processor = self._gemma4_processor
         prompt_fn = lambda text: build_prompt(processor, model.config, text)
-
-        # Pass 1: quick transcription (short max_tokens)
-        transcript = ""
-        for text in run_inference(
-            model, processor, audio_input,
-            "Briefly transcribe exactly what the user said, nothing else.",
-            max_tokens=100,
-            temperature=0.1,
-            prompt_builder=prompt_fn,
-        ):
-            transcript = text
-
-        # Update the latest user conversation item with the transcript
-        if transcript:
-            for i in range(len(session.conversation) - 1, -1, -1):
-                item = session.conversation[i]
-                if item.get("role") == "user":
-                    item["content"].append({"type": "text", "text": transcript})
-                    break
-
-        # Pass 2: generate response with full context
         prompt = self._build_context_prompt(session)
 
         results = []
