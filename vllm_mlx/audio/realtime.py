@@ -396,10 +396,14 @@ class RealtimeHandler:
         tokens = tokenizer.encode(text.strip() + "\n", add_special_tokens=False)
         chunks = []
         i = 0
+        total_windows = (len(tokens) + TTS_TEXT_WINDOW_SIZE - 1) // TTS_TEXT_WINDOW_SIZE
+        window_idx = 0
 
         while i < len(tokens):
             window = tokens[i:i + TTS_TEXT_WINDOW_SIZE]
             i += TTS_TEXT_WINDOW_SIZE
+            window_idx += 1
+            is_last_window = (i >= len(tokens))
             text_ids = mx.array([window])
 
             # Base LM
@@ -444,9 +448,12 @@ class RealtimeHandler:
                 state["neg_tts_lm_hidden"] = model.tts_language_model(inputs_embeds=tts_input, cache=state["neg_tts_lm_cache"])
                 mx.eval(state["tts_lm_hidden"], state["neg_tts_lm_hidden"])
 
-                eos = model.eos_classifier(state["tts_lm_hidden"][:, -1, :])
-                if mx.sigmoid(eos).item() > 0.5:
-                    return chunks
+                # Only check EOS after all text has been fed — the model
+                # sometimes fires EOS mid-utterance if checked too early
+                if is_last_window:
+                    eos = model.eos_classifier(state["tts_lm_hidden"][:, -1, :])
+                    if mx.sigmoid(eos).item() > 0.5:
+                        return chunks
 
         return chunks
 
