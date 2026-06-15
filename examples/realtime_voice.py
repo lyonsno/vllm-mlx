@@ -203,7 +203,11 @@ class RealtimeVoiceClient:
                         audio_still_playing = True
 
                 if audio_still_playing:
-                    voice_detected = False  # hard suppress during playback
+                    # During playback, require significantly louder input.
+                    # Your voice into the mic should be ~10x louder than
+                    # speaker echo. This allows real barge-in while
+                    # suppressing self-triggering.
+                    voice_detected = energy > self.vad_threshold * 10
                 else:
                     voice_detected = energy > self.vad_threshold
 
