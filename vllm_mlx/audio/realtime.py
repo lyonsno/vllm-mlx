@@ -352,7 +352,12 @@ class RealtimeHandler:
         return "Listen to this audio and respond naturally."
 
     def _gemma4_generate_sync(self, session, audio_input):
-        """Synchronous Gemma 4 generation in thread."""
+        """Synchronous Gemma 4 generation in thread.
+
+        Two-pass approach for multi-turn:
+        1. Quick transcription pass to get what the user said
+        2. Response pass with conversation history including the transcript
+        """
         from mlx_vlm.tools.gemma4_audio.core import load_model
         from mlx_vlm.tools.gemma4_audio.prompt import build_prompt
         from mlx_vlm.tools.gemma4_audio.inference import run_inference
@@ -365,6 +370,27 @@ class RealtimeHandler:
         model = self._gemma4_model
         processor = self._gemma4_processor
         prompt_fn = lambda text: build_prompt(processor, model.config, text)
+
+        # Pass 1: quick transcription (short max_tokens)
+        transcript = ""
+        for text in run_inference(
+            model, processor, audio_input,
+            "Briefly transcribe exactly what the user said, nothing else.",
+            max_tokens=100,
+            temperature=0.1,
+            prompt_builder=prompt_fn,
+        ):
+            transcript = text
+
+        # Update the latest user conversation item with the transcript
+        if transcript:
+            for i in range(len(session.conversation) - 1, -1, -1):
+                item = session.conversation[i]
+                if item.get("role") == "user":
+                    item["content"].append({"type": "text", "text": transcript})
+                    break
+
+        # Pass 2: generate response with full context
         prompt = self._build_context_prompt(session)
 
         results = []
