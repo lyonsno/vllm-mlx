@@ -343,21 +343,20 @@ class RealtimeHandler:
                 parts.append(f"Assistant: {text}{truncated}")
 
         if parts:
-            history = "\n".join(parts[-6:])  # last 3 turns max
+            history = "\n".join(parts[-8:])  # last 4 turns max
             return (
-                f"This is an ongoing voice conversation. Here is what has been said so far:\n"
+                f"You are in an ongoing voice conversation. "
+                f"The user is speaking to you via audio (you will hear their voice). "
+                f"Here is the conversation so far:\n\n"
                 f"{history}\n\n"
-                f"Now listen to the user's latest audio message and respond naturally. "
-                f"Continue the conversation — don't repeat greetings if you've already greeted them."
+                f"The user just said something new (listen to the audio). "
+                f"Respond to what they actually said. Do NOT repeat previous responses. "
+                f"Do NOT re-introduce yourself or say hello again."
             )
-        return "Listen to this audio and respond naturally in a conversational way."
+        return "The user is speaking to you via audio. Listen and respond naturally."
 
     def _gemma4_generate_sync(self, session, audio_input):
-        """Synchronous Gemma 4 generation in thread.
-
-        Single pass with conversation history. After generation, stores the
-        assistant's response in conversation for multi-turn context.
-        """
+        """Synchronous Gemma 4 generation with prompt cache for multi-turn."""
         from mlx_vlm.tools.gemma4_audio.core import load_model
         from mlx_vlm.tools.gemma4_audio.prompt import build_prompt
         from mlx_vlm.tools.gemma4_audio.inference import run_inference
