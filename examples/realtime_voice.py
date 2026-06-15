@@ -65,7 +65,7 @@ class RealtimeVoiceClient:
         print()
         print("=" * 60)
         print("  Realtime Voice — speak anytime, barge-in supported")
-        print(f"  VAD threshold: {self.vad_threshold}")
+        print(f"  VAD: silero (threshold: {self.vad_threshold})")
         print(f"  Silence to commit: {self.silence_duration}s")
         print("  Press Ctrl+C to exit")
         print("=" * 60)
@@ -162,9 +162,21 @@ class RealtimeVoiceClient:
                 print(f"\n[ERROR] {err.get('type')}: {err.get('message')}")
 
     async def _mic_loop(self):
-        """Continuously capture mic audio, detect speech, commit on silence."""
+        """Continuously capture mic audio, detect speech via silero VAD."""
+        import torch
+
+        # Load silero VAD
+        print("[vad] Loading silero-vad...", flush=True)
+        vad_model, _ = torch.hub.load(
+            repo_or_dir='snakers4/silero-vad', model='silero_vad', trust_repo=True
+        )
+        print("[vad] Ready", flush=True)
+
         loop = asyncio.get_running_loop()
         audio_queue = asyncio.Queue()
+
+        # Silero needs 512-sample chunks at 16kHz (32ms)
+        SILERO_CHUNK = 512
 
         def _callback(indata, frames, time_info, status):
             loop.call_soon_threadsafe(audio_queue.put_nowait, indata.copy())
@@ -173,7 +185,7 @@ class RealtimeVoiceClient:
             samplerate=SAMPLE_RATE_IN,
             channels=1,
             dtype='float32',
-            blocksize=int(SAMPLE_RATE_IN * CHUNK_DURATION),
+            blocksize=SILERO_CHUNK,
             callback=_callback,
         )
         self.mic_stream.start()
@@ -186,30 +198,13 @@ class RealtimeVoiceClient:
             while True:
                 chunk = await audio_queue.get()
                 chunk_flat = chunk.flatten()
-                energy = float(np.abs(chunk_flat).mean())
 
                 now = time.time()
 
-                # Echo cancellation: calculate whether the OS audio buffer
-                # is still playing based on samples written and elapsed time.
-                # OutputStream.write() is non-blocking — audio keeps playing
-                # in the OS buffer after write() returns.
-                audio_still_playing = False
-                if self.first_audio_write_time is not None and self.audio_samples_written > 0:
-                    playback_duration = self.audio_samples_written / SAMPLE_RATE_OUT
-                    elapsed = now - self.first_audio_write_time
-                    # Audio is still playing if elapsed < total duration + cooldown
-                    if elapsed < playback_duration + self.echo_cooldown:
-                        audio_still_playing = True
-
-                if audio_still_playing:
-                    # During playback, require significantly louder input.
-                    # Your voice into the mic should be ~10x louder than
-                    # speaker echo. This allows real barge-in while
-                    # suppressing self-triggering.
-                    voice_detected = energy > self.vad_threshold * 10
-                else:
-                    voice_detected = energy > self.vad_threshold
+                # Run silero VAD on the 512-sample chunk
+                chunk_tensor = torch.from_numpy(chunk_flat).unsqueeze(0)
+                speech_prob = vad_model(chunk_tensor, SAMPLE_RATE_IN).item()
+                voice_detected = speech_prob > self.vad_threshold
 
                 if voice_detected:
                     self.last_voice_time = now
@@ -267,8 +262,8 @@ def main():
     parser = argparse.ArgumentParser(description="Realtime voice client with barge-in")
     parser.add_argument("--url", default="ws://localhost:8000/v1/realtime")
     parser.add_argument("--voice", default="en-Davis_man")
-    parser.add_argument("--vad-threshold", type=float, default=0.015,
-                        help="Energy threshold for voice activity detection (default 0.015)")
+    parser.add_argument("--vad-threshold", type=float, default=0.5,
+                        help="Silero VAD speech probability threshold (0-1, default 0.5)")
     parser.add_argument("--silence-duration", type=float, default=0.8,
                         help="Seconds of silence before committing audio (default 0.8)")
     args = parser.parse_args()
