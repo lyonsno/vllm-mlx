@@ -59,6 +59,10 @@ class RealtimeSession:
     # Truncation tracking
     audio_chunks_sent: int = 0
     response_text_so_far: str = ""
+    # Async transcription of previous user audio
+    pending_transcription: Optional[asyncio.Task] = field(default=None, repr=False)
+    last_user_audio: Optional[np.ndarray] = field(default=None, repr=False)
+    last_user_item_id: Optional[str] = None
 
 
 class RealtimeHandler:
@@ -68,12 +72,14 @@ class RealtimeHandler:
       - Receiver loop runs continuously, processing client events
       - Response generation runs as a separate task
       - Barge-in: new audio commit cancels in-flight response
+      - STT transcription runs async after response completes
     """
 
     def __init__(self, mllm_engine=None):
         self.mllm_engine = mllm_engine
         self._tts_model = None
         self._tts_voice_prompt = None
+        self._stt_engine = None
 
     async def handle_websocket(self, websocket):
         """Main WebSocket handler — runs receiver loop."""
@@ -172,6 +178,14 @@ class RealtimeHandler:
         audio_float = audio_int16.astype(np.float32) / 32768.0
         session.audio_buffer = b""
 
+        # Wait for any pending transcription of the *previous* user turn
+        # before adding a new turn — ensures history is populated
+        if session.pending_transcription and not session.pending_transcription.done():
+            try:
+                await asyncio.wait_for(session.pending_transcription, timeout=3.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                logger.warning("Transcription timed out, proceeding without it")
+
         item_id = f"item_{uuid.uuid4().hex[:8]}"
         await self._send_event(websocket, "input_audio_buffer.committed", {
             "item_id": item_id,
@@ -183,6 +197,9 @@ class RealtimeHandler:
             "role": "user",
             "content": [{"type": "input_audio", "audio": audio_float}],
         })
+        # Save for async transcription after response
+        session.last_user_audio = audio_float
+        session.last_user_item_id = item_id
 
         # Launch response as concurrent task — receiver loop keeps running
         session.cancel_event.clear()
@@ -255,6 +272,14 @@ class RealtimeHandler:
             logger.error(f"Generation error: {e}")
             import traceback
             traceback.print_exc()
+
+        # Kick off async transcription of the user's audio for this turn.
+        # Runs in background — will be ready by the time the next turn commits.
+        if session.last_user_audio is not None:
+            session.pending_transcription = asyncio.create_task(
+                self._transcribe_user_audio(session, session.last_user_audio, session.last_user_item_id)
+            )
+            session.last_user_audio = None
             await self._send_error(websocket, "generation_error", str(e))
 
     async def _run_gemma4(self, websocket, session, response_id, item_id, audio_input):
@@ -354,6 +379,50 @@ class RealtimeHandler:
                 f"Do NOT re-introduce yourself or say hello again."
             )
         return "The user is speaking to you via audio. Listen and respond naturally."
+
+    async def _transcribe_user_audio(self, session, audio_float, item_id):
+        """Transcribe user audio in background using Parakeet STT.
+
+        Runs after the response completes (or is barged in on).
+        Updates the conversation item with the transcript so the next
+        turn's context prompt has real text instead of "[user spoke via audio]".
+        """
+        try:
+            transcript = await asyncio.to_thread(
+                self._transcribe_sync, audio_float
+            )
+            if transcript:
+                # Update the conversation item with the transcript
+                for item in session.conversation:
+                    if item.get("id") == item_id:
+                        item["content"].append({"type": "text", "text": transcript})
+                        break
+                logger.info(f"Transcribed user audio: {transcript[:80]}")
+        except Exception as e:
+            logger.warning(f"Transcription failed (non-fatal): {e}")
+
+    def _transcribe_sync(self, audio_float):
+        """Synchronous STT — writes temp WAV, runs Parakeet."""
+        import tempfile
+        import os
+        import soundfile as sf
+
+        if self._stt_engine is None:
+            from .stt import STTEngine, DEFAULT_PARAKEET_MODEL
+            logger.info(f"Loading STT model: {DEFAULT_PARAKEET_MODEL}")
+            self._stt_engine = STTEngine(DEFAULT_PARAKEET_MODEL)
+            self._stt_engine.load()
+            logger.info("STT model loaded")
+
+        # Write to temp WAV
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            temp_path = f.name
+        try:
+            sf.write(temp_path, audio_float, SAMPLE_RATE_IN)
+            result = self._stt_engine.transcribe(temp_path)
+            return result.text.strip() if result.text else ""
+        finally:
+            os.unlink(temp_path)
 
     def _gemma4_generate_sync(self, session, audio_input):
         """Synchronous Gemma 4 generation with prompt cache for multi-turn."""
