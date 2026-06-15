@@ -189,13 +189,12 @@ class RealtimeVoiceClient:
 
                 now = time.time()
 
-                # Suppress VAD while speaker is playing (echo cancellation)
-                # Use a higher threshold during cooldown period after playback
+                # Echo cancellation: completely suppress VAD during playback
+                # and for a cooldown period after. The speaker output feeds
+                # back into the mic and triggers false barge-ins.
                 in_cooldown = (now - self.playback_end_time) < self.echo_cooldown
                 if self.is_playing_audio or in_cooldown:
-                    # During playback/cooldown, require much louder input
-                    # to trigger barge-in (real speech over speaker output)
-                    voice_detected = energy > self.vad_threshold * 5
+                    voice_detected = False  # hard suppress — no barge-in during playback
                 else:
                     voice_detected = energy > self.vad_threshold
 

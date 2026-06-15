@@ -355,10 +355,14 @@ class RealtimeHandler:
                     elif c.get("type") == "input_audio":
                         has_audio = True
                 text = " ".join(text_parts)
-                if not text and has_audio:
-                    text = "[user spoke via audio]"
+                # Skip user audio turns with no transcript — including
+                # "[user spoke via audio]" confuses the model into responding
+                # to the placeholder text instead of listening to actual audio
+                if not text:
+                    continue
             else:
                 text = ""
+                continue
 
             if role == "user" and text:
                 parts.append(f"User: {text}")
@@ -369,15 +373,11 @@ class RealtimeHandler:
         if parts:
             history = "\n".join(parts[-8:])  # last 4 turns max
             return (
-                f"You are in an ongoing voice conversation. "
-                f"The user is speaking to you via audio (you will hear their voice). "
-                f"Here is the conversation so far:\n\n"
+                f"You are in a voice conversation. Here is what has been said:\n\n"
                 f"{history}\n\n"
-                f"The user just said something new (listen to the audio). "
-                f"Respond to what they actually said. Do NOT repeat previous responses. "
-                f"Do NOT re-introduce yourself or say hello again."
+                f"Listen to what the user says next and continue the conversation."
             )
-        return "The user is speaking to you via audio. Listen and respond naturally."
+        return "Listen to what the user says and respond."
 
     async def _transcribe_user_audio(self, session, audio_float, item_id):
         """Transcribe user audio in background using Parakeet STT.
