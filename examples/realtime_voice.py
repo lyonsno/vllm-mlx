@@ -46,9 +46,9 @@ class RealtimeVoiceClient:
         # State
         self.is_speaking = False       # user is speaking
         self.is_responding = False     # server is generating
-        self.is_playing_audio = False  # speaker is outputting audio
-        self.playback_end_time = 0    # when playback stopped (for cooldown)
-        self.echo_cooldown = 0.5      # seconds to suppress VAD after playback
+        self.audio_samples_written = 0 # total samples written to output stream
+        self.first_audio_write_time = None  # when first sample was written
+        self.echo_cooldown = 1.0      # seconds to suppress VAD after playback ends
         self.speech_start_time = None
         self.last_voice_time = 0
         self.audio_chunks_received = 0
@@ -113,6 +113,8 @@ class RealtimeVoiceClient:
             if etype == "response.created":
                 self.is_responding = True
                 self.audio_chunks_received = 0
+                self.audio_samples_written = 0
+                self.first_audio_write_time = None
                 self.first_audio_time = None
                 self.response_text = ""
 
@@ -131,21 +133,20 @@ class RealtimeVoiceClient:
                     chunk_int16 = np.frombuffer(chunk_bytes, dtype=np.int16)
                     chunk_float = chunk_int16.astype(np.float32) / 32768.0
                     self.out_stream.write(chunk_float.reshape(-1, 1))
-                    self.is_playing_audio = True
+                    self.audio_samples_written += len(chunk_float)
                     self.audio_chunks_received += 1
+                    if self.first_audio_write_time is None:
+                        self.first_audio_write_time = time.time()
                     if self.first_audio_time is None:
                         self.first_audio_time = time.time()
 
             elif etype == "response.audio.truncated":
-                self.is_playing_audio = False
-                self.playback_end_time = time.time()
                 audio_end_ms = event.get("audio_end_ms", 0)
                 chunks = event.get("chunks_played", 0)
                 print(f"\n[barge-in] truncated at {audio_end_ms}ms ({chunks} chunks)")
 
             elif etype == "response.audio.done":
-                self.is_playing_audio = False
-                self.playback_end_time = time.time()
+                pass  # playback tracking handled by sample count
 
             elif etype == "response.done":
                 self.is_responding = False
@@ -189,12 +190,20 @@ class RealtimeVoiceClient:
 
                 now = time.time()
 
-                # Echo cancellation: completely suppress VAD during playback
-                # and for a cooldown period after. The speaker output feeds
-                # back into the mic and triggers false barge-ins.
-                in_cooldown = (now - self.playback_end_time) < self.echo_cooldown
-                if self.is_playing_audio or in_cooldown:
-                    voice_detected = False  # hard suppress — no barge-in during playback
+                # Echo cancellation: calculate whether the OS audio buffer
+                # is still playing based on samples written and elapsed time.
+                # OutputStream.write() is non-blocking — audio keeps playing
+                # in the OS buffer after write() returns.
+                audio_still_playing = False
+                if self.first_audio_write_time is not None and self.audio_samples_written > 0:
+                    playback_duration = self.audio_samples_written / SAMPLE_RATE_OUT
+                    elapsed = now - self.first_audio_write_time
+                    # Audio is still playing if elapsed < total duration + cooldown
+                    if elapsed < playback_duration + self.echo_cooldown:
+                        audio_still_playing = True
+
+                if audio_still_playing:
+                    voice_detected = False  # hard suppress during playback
                 else:
                     voice_detected = energy > self.vad_threshold
 
