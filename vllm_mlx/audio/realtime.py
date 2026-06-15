@@ -316,14 +316,23 @@ class RealtimeHandler:
     def _build_context_prompt(self, session):
         """Build a prompt that includes conversation history for multi-turn."""
         parts = []
-        for item in session.conversation:
+        for item in session.conversation[:-1]:  # exclude the current (latest) user audio
             role = item.get("role", "")
             content = item.get("content", [])
+
             if isinstance(content, str):
                 text = content
             elif isinstance(content, list):
-                text_parts = [c.get("text", "") for c in content if c.get("type") == "text"]
+                text_parts = []
+                has_audio = False
+                for c in content:
+                    if c.get("type") == "text" and c.get("text"):
+                        text_parts.append(c["text"])
+                    elif c.get("type") == "input_audio":
+                        has_audio = True
                 text = " ".join(text_parts)
+                if not text and has_audio:
+                    text = "[user spoke via audio]"
             else:
                 text = ""
 
