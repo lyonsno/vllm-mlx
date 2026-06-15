@@ -206,10 +206,6 @@ class RealtimeHandler:
 
     async def _run_gemma4(self, websocket, session, response_id, item_id, audio_input):
         """Run Gemma 4 audio understanding and stream text deltas."""
-        if self.mllm_engine is None:
-            await self._send_error(websocket, "no_model", "MLLM engine not loaded")
-            return None
-
         await self._send_event(websocket, "response.output_item.added", {
             "response_id": response_id,
             "item": {"id": item_id, "type": "message", "role": "assistant"},
@@ -262,22 +258,26 @@ class RealtimeHandler:
 
         return full_text
 
+    _gemma4_model = None
+    _gemma4_processor = None
+
     def _gemma4_generate_sync(self, session, audio_input):
-        """Synchronous Gemma 4 generation — runs in thread."""
-        from mlx_vlm.utils import load as load_vlm
-        from mlx_vlm import stream_generate
+        """Synchronous Gemma 4 generation — runs in thread.
 
-        # Load model if needed (MLLM engine handles this)
-        if self.mllm_engine is not None and hasattr(self.mllm_engine, 'generate_from_audio'):
-            return self.mllm_engine.generate_from_audio(audio_input, session)
-
-        # Fallback: use mlx_vlm directly
-        import mlx.core as mx
+        Uses mlx_vlm Gemma 4 audio tools directly for native audio
+        understanding (no Whisper, no text-only path).
+        """
         from mlx_vlm.tools.gemma4_audio.core import load_model
         from mlx_vlm.tools.gemma4_audio.prompt import build_prompt
         from mlx_vlm.tools.gemma4_audio.inference import run_inference
 
-        model, processor = load_model(session.model_name)
+        if self._gemma4_model is None:
+            logger.info(f"Loading Gemma 4 audio model: {session.model_name}")
+            self._gemma4_model, self._gemma4_processor = load_model(session.model_name)
+            logger.info("Gemma 4 audio model loaded")
+
+        model = self._gemma4_model
+        processor = self._gemma4_processor
         prompt_fn = lambda text: build_prompt(processor, model.config, text)
         prompt = "Listen to this audio and respond naturally."
 
