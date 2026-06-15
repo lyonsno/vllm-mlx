@@ -280,7 +280,6 @@ class RealtimeHandler:
                 self._transcribe_user_audio(session, session.last_user_audio, session.last_user_item_id)
             )
             session.last_user_audio = None
-            await self._send_error(websocket, "generation_error", str(e))
 
     async def _run_gemma4(self, websocket, session, response_id, item_id, audio_input):
         """Run Gemma 4 audio understanding, streaming text deltas. Cancel-aware."""
