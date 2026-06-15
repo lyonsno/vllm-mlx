@@ -122,10 +122,17 @@ async def run_realtime(url: str, seconds: float, voice: str):
                 print(f"\n[ERROR] {err.get('type')}: {err.get('message')}")
                 break
 
-        # Let output stream drain
-        remaining = total_audio_samples / SAMPLE_RATE_OUT - (time.time() - (t_first_audio or t0))
-        if remaining > 0:
-            time.sleep(remaining + 0.2)
+        # Wait for the sounddevice output buffer to finish playing.
+        # OutputStream.write() is non-blocking — audio keeps playing in the
+        # OS buffer after the last write. We need to wait for it to drain.
+        if total_audio_samples > 0 and t_first_audio is not None:
+            # Total audio duration minus time already elapsed since first chunk
+            audio_duration = total_audio_samples / SAMPLE_RATE_OUT
+            elapsed_since_first = time.time() - t_first_audio
+            drain_wait = audio_duration - elapsed_since_first + 0.3
+            if drain_wait > 0:
+                print(f"[draining {drain_wait:.1f}s of buffered audio...]")
+                time.sleep(drain_wait)
         out_stream.stop()
         out_stream.close()
 
