@@ -46,6 +46,9 @@ class RealtimeVoiceClient:
         # State
         self.is_speaking = False       # user is speaking
         self.is_responding = False     # server is generating
+        self.is_playing_audio = False  # speaker is outputting audio
+        self.playback_end_time = 0    # when playback stopped (for cooldown)
+        self.echo_cooldown = 0.5      # seconds to suppress VAD after playback
         self.speech_start_time = None
         self.last_voice_time = 0
         self.audio_chunks_received = 0
@@ -128,17 +131,21 @@ class RealtimeVoiceClient:
                     chunk_int16 = np.frombuffer(chunk_bytes, dtype=np.int16)
                     chunk_float = chunk_int16.astype(np.float32) / 32768.0
                     self.out_stream.write(chunk_float.reshape(-1, 1))
+                    self.is_playing_audio = True
                     self.audio_chunks_received += 1
                     if self.first_audio_time is None:
                         self.first_audio_time = time.time()
 
             elif etype == "response.audio.truncated":
+                self.is_playing_audio = False
+                self.playback_end_time = time.time()
                 audio_end_ms = event.get("audio_end_ms", 0)
                 chunks = event.get("chunks_played", 0)
                 print(f"\n[barge-in] truncated at {audio_end_ms}ms ({chunks} chunks)")
 
             elif etype == "response.audio.done":
-                pass
+                self.is_playing_audio = False
+                self.playback_end_time = time.time()
 
             elif etype == "response.done":
                 self.is_responding = False
@@ -181,7 +188,16 @@ class RealtimeVoiceClient:
                 energy = float(np.abs(chunk_flat).mean())
 
                 now = time.time()
-                voice_detected = energy > self.vad_threshold
+
+                # Suppress VAD while speaker is playing (echo cancellation)
+                # Use a higher threshold during cooldown period after playback
+                in_cooldown = (now - self.playback_end_time) < self.echo_cooldown
+                if self.is_playing_audio or in_cooldown:
+                    # During playback/cooldown, require much louder input
+                    # to trigger barge-in (real speech over speaker output)
+                    voice_detected = energy > self.vad_threshold * 5
+                else:
+                    voice_detected = energy > self.vad_threshold
 
                 if voice_detected:
                     self.last_voice_time = now

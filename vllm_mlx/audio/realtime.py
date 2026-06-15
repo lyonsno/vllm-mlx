@@ -313,6 +313,35 @@ class RealtimeHandler:
     _gemma4_model = None
     _gemma4_processor = None
 
+    def _build_context_prompt(self, session):
+        """Build a prompt that includes conversation history for multi-turn."""
+        parts = []
+        for item in session.conversation:
+            role = item.get("role", "")
+            content = item.get("content", [])
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text_parts = [c.get("text", "") for c in content if c.get("type") == "text"]
+                text = " ".join(text_parts)
+            else:
+                text = ""
+
+            if role == "user" and text:
+                parts.append(f"User: {text}")
+            elif role == "assistant" and text:
+                truncated = " [interrupted]" if item.get("truncated") else ""
+                parts.append(f"Assistant: {text}{truncated}")
+
+        if parts:
+            history = "\n".join(parts[-6:])  # last 3 turns max
+            return (
+                f"Previous conversation:\n{history}\n\n"
+                f"Listen to the user's new audio message and respond naturally, "
+                f"taking the conversation history into account."
+            )
+        return "Listen to this audio and respond naturally."
+
     def _gemma4_generate_sync(self, session, audio_input):
         """Synchronous Gemma 4 generation in thread."""
         from mlx_vlm.tools.gemma4_audio.core import load_model
@@ -327,7 +356,7 @@ class RealtimeHandler:
         model = self._gemma4_model
         processor = self._gemma4_processor
         prompt_fn = lambda text: build_prompt(processor, model.config, text)
-        prompt = "Listen to this audio and respond naturally."
+        prompt = self._build_context_prompt(session)
 
         results = []
         for text in run_inference(
