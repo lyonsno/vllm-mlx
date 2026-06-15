@@ -293,18 +293,38 @@ class RealtimeHandler:
         return results
 
     async def _run_tts(self, websocket, session, response_id, item_id, text):
-        """Run VibeVoice TTS and stream audio chunks."""
+        """Run VibeVoice TTS, streaming each audio chunk over WebSocket as it's generated."""
         await self._send_event(websocket, "response.audio.started", {
             "response_id": response_id,
             "item_id": item_id,
         })
 
-        try:
-            chunks = await asyncio.to_thread(
-                self._tts_generate_sync, session, text
-            )
+        # Bridge: TTS thread puts chunks into queue, async loop sends them
+        chunk_queue = asyncio.Queue()
+        _DONE = object()
 
-            for chunk_float32 in chunks:
+        def _produce():
+            try:
+                for chunk in self._tts_generate_streaming(session, text):
+                    asyncio.get_event_loop().call_soon_threadsafe(chunk_queue.put_nowait, chunk)
+            except Exception as e:
+                asyncio.get_event_loop().call_soon_threadsafe(chunk_queue.put_nowait, e)
+            finally:
+                asyncio.get_event_loop().call_soon_threadsafe(chunk_queue.put_nowait, _DONE)
+
+        loop = asyncio.get_event_loop()
+        import threading
+        producer = threading.Thread(target=_produce, daemon=True)
+        producer.start()
+
+        try:
+            while True:
+                item = await chunk_queue.get()
+                if item is _DONE:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+
                 if session.should_cancel:
                     await self._send_event(websocket, "response.audio.truncated", {
                         "response_id": response_id,
@@ -312,8 +332,7 @@ class RealtimeHandler:
                     })
                     break
 
-                # Convert float32 → PCM16 → base64
-                chunk_int16 = (chunk_float32 * 32767).astype(np.int16)
+                chunk_int16 = (item * 32767).astype(np.int16)
                 audio_b64 = base64.b64encode(chunk_int16.tobytes()).decode("ascii")
 
                 await self._send_event(websocket, "response.audio.delta", {
@@ -326,13 +345,15 @@ class RealtimeHandler:
             logger.error(f"TTS error: {e}")
             await self._send_error(websocket, "tts_error", str(e))
 
+        producer.join(timeout=5)
+
         await self._send_event(websocket, "response.audio.done", {
             "response_id": response_id,
             "item_id": item_id,
         })
 
-    def _tts_generate_sync(self, session, text):
-        """Synchronous VibeVoice generation — returns list of audio chunks."""
+    def _tts_generate_streaming(self, session, text):
+        """VibeVoice generation as a generator — yields audio chunks as produced."""
         import copy
         import mlx.core as mx
 
@@ -394,15 +415,11 @@ class RealtimeHandler:
         }
 
         tokens = tokenizer.encode(text.strip() + "\n", add_special_tokens=False)
-        chunks = []
         i = 0
-        total_windows = (len(tokens) + TTS_TEXT_WINDOW_SIZE - 1) // TTS_TEXT_WINDOW_SIZE
-        window_idx = 0
 
         while i < len(tokens):
             window = tokens[i:i + TTS_TEXT_WINDOW_SIZE]
             i += TTS_TEXT_WINDOW_SIZE
-            window_idx += 1
             is_last_window = (i >= len(tokens))
             text_ids = mx.array([window])
 
@@ -438,7 +455,7 @@ class RealtimeHandler:
                 audio_chunk = model.acoustic_decoder(scaled_for_decode, cache=state["acoustic_cache"])
                 mx.eval(audio_chunk)
 
-                chunks.append(np.array(audio_chunk.reshape(-1), dtype=np.float32))
+                yield np.array(audio_chunk.reshape(-1), dtype=np.float32)
 
                 # Feed back
                 acoustic_embed = model.acoustic_connector(speech_latent.reshape(1, 1, -1))
@@ -448,14 +465,10 @@ class RealtimeHandler:
                 state["neg_tts_lm_hidden"] = model.tts_language_model(inputs_embeds=tts_input, cache=state["neg_tts_lm_cache"])
                 mx.eval(state["tts_lm_hidden"], state["neg_tts_lm_hidden"])
 
-                # Only check EOS after all text has been fed — the model
-                # sometimes fires EOS mid-utterance if checked too early
                 if is_last_window:
                     eos = model.eos_classifier(state["tts_lm_hidden"][:, -1, :])
                     if mx.sigmoid(eos).item() > 0.5:
-                        return chunks
-
-        return chunks
+                        return
 
     async def _send_event(self, websocket, event_type, data):
         """Send a server event."""

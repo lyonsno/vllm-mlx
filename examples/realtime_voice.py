@@ -73,10 +73,15 @@ async def run_realtime(url: str, seconds: float, voice: str):
         await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
         print("Audio sent, waiting for response...\n")
 
-        # Collect response
+        # Collect response — play audio as it streams
         full_text = ""
-        audio_chunks = []
+        total_audio_samples = 0
         t0 = time.time()
+        t_first_audio = None
+
+        # Open output stream for immediate playback
+        out_stream = sd.OutputStream(samplerate=SAMPLE_RATE_OUT, channels=1, dtype='float32')
+        out_stream.start()
 
         async for message in ws:
             event = json.loads(message)
@@ -96,17 +101,18 @@ async def run_realtime(url: str, seconds: float, voice: str):
                     chunk_bytes = base64.b64decode(audio_b64)
                     chunk_int16 = np.frombuffer(chunk_bytes, dtype=np.int16)
                     chunk_float = chunk_int16.astype(np.float32) / 32768.0
-                    audio_chunks.append(chunk_float)
+                    # Play immediately
+                    out_stream.write(chunk_float.reshape(-1, 1))
+                    total_audio_samples += len(chunk_float)
+                    if t_first_audio is None:
+                        t_first_audio = time.time()
+                        print(f"[first audio chunk at {t_first_audio - t0:.1f}s]")
 
             elif etype == "response.audio.done":
                 total_time = time.time() - t0
-                if audio_chunks:
-                    full_audio = np.concatenate(audio_chunks)
-                    duration = len(full_audio) / SAMPLE_RATE_OUT
+                if total_audio_samples > 0:
+                    duration = total_audio_samples / SAMPLE_RATE_OUT
                     print(f"[audio done: {duration:.1f}s audio in {total_time:.1f}s, RTF={total_time/duration:.2f}x]")
-                    print("Playing response...")
-                    sd.play(full_audio, samplerate=SAMPLE_RATE_OUT)
-                    sd.wait()
 
             elif etype == "response.done":
                 break
@@ -115,6 +121,13 @@ async def run_realtime(url: str, seconds: float, voice: str):
                 err = event.get("error", {})
                 print(f"\n[ERROR] {err.get('type')}: {err.get('message')}")
                 break
+
+        # Let output stream drain
+        remaining = total_audio_samples / SAMPLE_RATE_OUT - (time.time() - (t_first_audio or t0))
+        if remaining > 0:
+            time.sleep(remaining + 0.2)
+        out_stream.stop()
+        out_stream.close()
 
     print("\nDone.")
 
