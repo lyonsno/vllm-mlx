@@ -55,7 +55,7 @@ from collections.abc import AsyncIterator
 from contextlib import suppress
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
@@ -4104,6 +4104,58 @@ async def list_voices(model: str = "kokoro"):
         return {"voices": CHATTERBOX_VOICES}
     else:
         return {"voices": ["default"]}
+
+
+# =============================================================================
+# Realtime voice endpoint (WebSocket)
+# =============================================================================
+
+_realtime_handler = None
+
+
+@app.websocket("/v1/realtime")
+async def realtime_endpoint(websocket: WebSocket, model: str = "gemma-4-12B-it-4bit"):
+    """
+    WebSocket endpoint for realtime voice interaction.
+
+    Implements a subset of the OpenAI Realtime API:
+    - Audio input via input_audio_buffer.append/commit
+    - Text + audio streaming response
+    - Barge-in via response.cancel or new audio input
+
+    Audio input: base64 PCM16 @ 16kHz mono
+    Audio output: base64 PCM16 @ 24kHz mono
+    """
+    await websocket.accept()
+
+    global _realtime_handler
+
+    try:
+        from .audio.realtime import RealtimeHandler
+
+        if _realtime_handler is None:
+            _realtime_handler = RealtimeHandler()
+
+        await _realtime_handler.handle_websocket(websocket)
+
+    except WebSocketDisconnect:
+        logger.info("Realtime WebSocket client disconnected")
+    except ImportError as e:
+        await websocket.send_text(json.dumps({
+            "type": "error",
+            "error": {"type": "import_error", "message": str(e)},
+        }))
+        await websocket.close()
+    except Exception as e:
+        logger.error(f"Realtime WebSocket error: {e}")
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "error": {"type": "server_error", "message": str(e)},
+            }))
+        except Exception:
+            pass
+        await websocket.close()
 
 
 # =============================================================================
