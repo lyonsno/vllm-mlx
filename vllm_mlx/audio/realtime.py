@@ -2,22 +2,29 @@
 """
 Realtime voice endpoint — WebSocket-based bidirectional audio streaming.
 
-Minimal OpenAI Realtime API shape:
-  - Client sends audio chunks (base64 PCM16 @ 16kHz)
-  - Server responds with text deltas + audio chunks (base64 PCM16 @ 24kHz)
-  - Barge-in: new audio input truncates in-progress response
+OpenAI Realtime API shape with barge-in support:
+  - Client streams audio continuously via input_audio_buffer.append
+  - Server streams text deltas + audio chunks concurrently
+  - Barge-in: new audio commit during response → truncate + restart
+  - Truncation tracking: server reports exactly how much audio played
 
 Architecture:
   - Audio input → Gemma 4 (native audio modality via MLLM, no Whisper)
   - Text generation → streamed back as text deltas
   - Text → VibeVoice-Realtime-0.5B (MLX native diffusion TTS)
   - Audio output → streamed back as audio chunks
+
+Concurrency model:
+  - Receiver task: reads all client WebSocket messages
+  - Response task: runs Gemma 4 + VibeVoice, sends events
+  - Barge-in: receiver signals cancellation, response task truncates
 """
 
 import asyncio
 import base64
 import json
 import logging
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -29,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 SAMPLE_RATE_IN = 16000   # Gemma 4 expects 16kHz
 SAMPLE_RATE_OUT = 24000  # VibeVoice outputs 24kHz
+SAMPLES_PER_CHUNK = 3200  # VibeVoice: one latent frame = 3200 samples
+MS_PER_CHUNK = int(SAMPLES_PER_CHUNK / SAMPLE_RATE_OUT * 1000)  # ~133ms
 
 
 @dataclass
@@ -37,10 +46,6 @@ class RealtimeSession:
     session_id: str = field(default_factory=lambda: f"sess_{uuid.uuid4().hex[:12]}")
     conversation: list = field(default_factory=list)
     audio_buffer: bytes = b""
-    is_generating: bool = False
-    should_cancel: bool = False
-    input_audio_sr: int = SAMPLE_RATE_IN
-    output_audio_sr: int = SAMPLE_RATE_OUT
     model_name: str = "mlx-community/gemma-4-12B-it-4bit"
     tts_voice: str = "en-Davis_man"
     cfg_scale: float = 1.5
@@ -48,13 +53,21 @@ class RealtimeSession:
     max_response_tokens: int = 512
     temperature: float = 0.3
 
+    # Concurrency state
+    response_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    # Truncation tracking
+    audio_chunks_sent: int = 0
+    response_text_so_far: str = ""
+
 
 class RealtimeHandler:
-    """Handles one WebSocket realtime session.
+    """Handles one WebSocket realtime session with barge-in.
 
-    Integrates:
-      - mlx-vlm MLLM for Gemma 4 audio understanding
-      - VibeVoice MLX for streaming TTS output
+    Concurrent architecture:
+      - Receiver loop runs continuously, processing client events
+      - Response generation runs as a separate task
+      - Barge-in: new audio commit cancels in-flight response
     """
 
     def __init__(self, mllm_engine=None):
@@ -63,10 +76,9 @@ class RealtimeHandler:
         self._tts_voice_prompt = None
 
     async def handle_websocket(self, websocket):
-        """Main WebSocket handler — dispatches client events."""
+        """Main WebSocket handler — runs receiver loop."""
         session = RealtimeSession()
 
-        # Send session.created
         await self._send_event(websocket, "session.created", {
             "session": {
                 "id": session.session_id,
@@ -80,7 +92,7 @@ class RealtimeHandler:
                 try:
                     event = json.loads(message)
                 except json.JSONDecodeError:
-                    await self._send_error(websocket, "invalid_json", "Could not parse message as JSON")
+                    await self._send_error(websocket, "invalid_json", "Could not parse message")
                     continue
 
                 event_type = event.get("type", "")
@@ -88,18 +100,19 @@ class RealtimeHandler:
 
         except Exception as e:
             logger.error(f"WebSocket error in session {session.session_id}: {e}")
+        finally:
+            # Clean up any running response
+            await self._cancel_response(session)
 
     async def _dispatch_event(self, websocket, session, event_type, event):
-        """Route client events to handlers."""
+        """Route client events."""
 
         if event_type == "session.update":
             config = event.get("session", {})
-            if "model" in config:
-                session.model_name = config["model"]
-            if "voice" in config:
-                session.tts_voice = config["voice"]
-            if "temperature" in config:
-                session.temperature = config["temperature"]
+            for key in ("model", "voice", "temperature"):
+                if key in config:
+                    mapped = {"model": "model_name", "voice": "tts_voice"}.get(key, key)
+                    setattr(session, mapped, config[key])
             if "max_response_output_tokens" in config:
                 session.max_response_tokens = config["max_response_output_tokens"]
             await self._send_event(websocket, "session.updated", {
@@ -112,11 +125,19 @@ class RealtimeHandler:
                 session.audio_buffer += base64.b64decode(audio_b64)
 
         elif event_type == "input_audio_buffer.commit":
+            # BARGE-IN: if a response is running, cancel it first
+            if session.response_task and not session.response_task.done():
+                await self._cancel_response(session)
+
             await self._handle_audio_commit(websocket, session)
 
         elif event_type == "input_audio_buffer.clear":
             session.audio_buffer = b""
             await self._send_event(websocket, "input_audio_buffer.cleared", {})
+
+        elif event_type == "response.cancel":
+            await self._cancel_response(session)
+            await self._send_event(websocket, "response.cancelled", {})
 
         elif event_type == "conversation.item.create":
             item = event.get("item", {})
@@ -124,33 +145,38 @@ class RealtimeHandler:
             await self._send_event(websocket, "conversation.item.created", {"item": item})
 
         elif event_type == "response.create":
-            # Trigger generation from conversation history (text mode)
-            asyncio.create_task(self._generate_response(websocket, session))
+            if session.response_task and not session.response_task.done():
+                await self._cancel_response(session)
+            session.response_task = asyncio.create_task(
+                self._generate_response(websocket, session)
+            )
 
-        elif event_type == "response.cancel":
-            session.should_cancel = True
-            await self._send_event(websocket, "response.cancelled", {})
-
-        else:
-            logger.debug(f"Unhandled event type: {event_type}")
+    async def _cancel_response(self, session):
+        """Cancel in-flight response and report truncation."""
+        if session.response_task and not session.response_task.done():
+            session.cancel_event.set()
+            try:
+                await asyncio.wait_for(session.response_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                session.response_task.cancel()
+            session.response_task = None
+        session.cancel_event.clear()
 
     async def _handle_audio_commit(self, websocket, session):
-        """Process committed audio buffer — run Gemma 4 + VibeVoice response."""
+        """Process committed audio buffer — start response generation."""
         if not session.audio_buffer:
             await self._send_error(websocket, "empty_audio", "No audio in buffer")
             return
 
-        # Convert PCM16 bytes to float32 numpy
         audio_int16 = np.frombuffer(session.audio_buffer, dtype=np.int16)
         audio_float = audio_int16.astype(np.float32) / 32768.0
         session.audio_buffer = b""
 
+        item_id = f"item_{uuid.uuid4().hex[:8]}"
         await self._send_event(websocket, "input_audio_buffer.committed", {
-            "item_id": f"item_{uuid.uuid4().hex[:8]}",
+            "item_id": item_id,
         })
 
-        # Add to conversation as user audio
-        item_id = f"item_{uuid.uuid4().hex[:8]}"
         session.conversation.append({
             "id": item_id,
             "type": "message",
@@ -158,54 +184,81 @@ class RealtimeHandler:
             "content": [{"type": "input_audio", "audio": audio_float}],
         })
 
-        # Generate response
-        await self._generate_response(websocket, session, audio_input=audio_float)
+        # Launch response as concurrent task — receiver loop keeps running
+        session.cancel_event.clear()
+        session.response_task = asyncio.create_task(
+            self._generate_response(websocket, session, audio_input=audio_float)
+        )
 
     async def _generate_response(self, websocket, session, audio_input=None):
-        """Run Gemma 4 generation + VibeVoice TTS streaming."""
-        if session.is_generating:
-            session.should_cancel = True
-            # Wait briefly for cancellation
-            for _ in range(10):
-                if not session.is_generating:
-                    break
-                await asyncio.sleep(0.05)
-
-        session.is_generating = True
-        session.should_cancel = False
-
+        """Run Gemma 4 + VibeVoice TTS with barge-in awareness."""
         response_id = f"resp_{uuid.uuid4().hex[:8]}"
         item_id = f"item_{uuid.uuid4().hex[:8]}"
+        session.audio_chunks_sent = 0
+        session.response_text_so_far = ""
 
         await self._send_event(websocket, "response.created", {
             "response": {"id": response_id}
         })
 
         try:
-            # Generate text from audio using Gemma 4 via MLLM
+            # Generate text
             text_response = await self._run_gemma4(
                 websocket, session, response_id, item_id, audio_input
             )
 
-            if text_response and not session.should_cancel:
+            if text_response and not session.cancel_event.is_set():
                 # Stream TTS audio
                 await self._run_tts(
                     websocket, session, response_id, item_id, text_response
                 )
 
+            # If we were cancelled (barge-in), send truncation info
+            if session.cancel_event.is_set():
+                audio_end_ms = session.audio_chunks_sent * MS_PER_CHUNK
+                await self._send_event(websocket, "response.audio.truncated", {
+                    "response_id": response_id,
+                    "item_id": item_id,
+                    "audio_end_ms": audio_end_ms,
+                    "chunks_played": session.audio_chunks_sent,
+                })
+
+                # Truncate the assistant message in conversation history
+                # to only what was actually heard
+                if session.response_text_so_far:
+                    truncated_item = {
+                        "id": item_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": session.response_text_so_far}],
+                        "truncated": True,
+                        "audio_end_ms": audio_end_ms,
+                    }
+                    # Replace the last assistant message if it exists
+                    for i in range(len(session.conversation) - 1, -1, -1):
+                        if session.conversation[i].get("id") == item_id:
+                            session.conversation[i] = truncated_item
+                            break
+                    else:
+                        session.conversation.append(truncated_item)
+
             await self._send_event(websocket, "response.done", {
-                "response": {"id": response_id}
+                "response": {
+                    "id": response_id,
+                    "status": "cancelled" if session.cancel_event.is_set() else "completed",
+                }
             })
 
+        except asyncio.CancelledError:
+            logger.info(f"Response {response_id} cancelled")
         except Exception as e:
             logger.error(f"Generation error: {e}")
+            import traceback
+            traceback.print_exc()
             await self._send_error(websocket, "generation_error", str(e))
 
-        finally:
-            session.is_generating = False
-
     async def _run_gemma4(self, websocket, session, response_id, item_id, audio_input):
-        """Run Gemma 4 audio understanding and stream text deltas."""
+        """Run Gemma 4 audio understanding, streaming text deltas. Cancel-aware."""
         await self._send_event(websocket, "response.output_item.added", {
             "response_id": response_id,
             "item": {"id": item_id, "type": "message", "role": "assistant"},
@@ -219,18 +272,18 @@ class RealtimeHandler:
         full_text = ""
 
         try:
-            # Use mlx_vlm to process audio through Gemma 4
             text_gen = await asyncio.to_thread(
                 self._gemma4_generate_sync, session, audio_input
             )
 
             for delta in text_gen:
-                if session.should_cancel:
+                if session.cancel_event.is_set():
                     break
 
                 new_text = delta[len(full_text):]
                 if new_text:
                     full_text = delta
+                    session.response_text_so_far = full_text
                     await self._send_event(websocket, "response.text.delta", {
                         "response_id": response_id,
                         "item_id": item_id,
@@ -241,14 +294,13 @@ class RealtimeHandler:
             logger.error(f"Gemma 4 generation error: {e}")
             await self._send_error(websocket, "model_error", str(e))
 
-        if full_text:
+        if full_text and not session.cancel_event.is_set():
             await self._send_event(websocket, "response.text.done", {
                 "response_id": response_id,
                 "item_id": item_id,
                 "text": full_text,
             })
 
-            # Add to conversation history
             session.conversation.append({
                 "id": item_id,
                 "type": "message",
@@ -262,11 +314,7 @@ class RealtimeHandler:
     _gemma4_processor = None
 
     def _gemma4_generate_sync(self, session, audio_input):
-        """Synchronous Gemma 4 generation — runs in thread.
-
-        Uses mlx_vlm Gemma 4 audio tools directly for native audio
-        understanding (no Whisper, no text-only path).
-        """
+        """Synchronous Gemma 4 generation in thread."""
         from mlx_vlm.tools.gemma4_audio.core import load_model
         from mlx_vlm.tools.gemma4_audio.prompt import build_prompt
         from mlx_vlm.tools.gemma4_audio.inference import run_inference
@@ -293,13 +341,12 @@ class RealtimeHandler:
         return results
 
     async def _run_tts(self, websocket, session, response_id, item_id, text):
-        """Run VibeVoice TTS, streaming each audio chunk over WebSocket as it's generated."""
+        """Stream VibeVoice TTS audio chunks. Cancel-aware."""
         await self._send_event(websocket, "response.audio.started", {
             "response_id": response_id,
             "item_id": item_id,
         })
 
-        # Bridge: TTS thread puts chunks into queue, async loop sends them
         chunk_queue = asyncio.Queue()
         _DONE = object()
         loop = asyncio.get_running_loop()
@@ -307,13 +354,14 @@ class RealtimeHandler:
         def _produce():
             try:
                 for chunk in self._tts_generate_streaming(session, text):
+                    if session.cancel_event.is_set():
+                        break
                     loop.call_soon_threadsafe(chunk_queue.put_nowait, chunk)
             except Exception as e:
                 loop.call_soon_threadsafe(chunk_queue.put_nowait, e)
             finally:
                 loop.call_soon_threadsafe(chunk_queue.put_nowait, _DONE)
 
-        import threading
         producer = threading.Thread(target=_produce, daemon=True)
         producer.start()
 
@@ -325,11 +373,7 @@ class RealtimeHandler:
                 if isinstance(item, Exception):
                     raise item
 
-                if session.should_cancel:
-                    await self._send_event(websocket, "response.audio.truncated", {
-                        "response_id": response_id,
-                        "item_id": item_id,
-                    })
+                if session.cancel_event.is_set():
                     break
 
                 chunk_int16 = (item * 32767).astype(np.int16)
@@ -340,6 +384,7 @@ class RealtimeHandler:
                     "item_id": item_id,
                     "delta": audio_b64,
                 })
+                session.audio_chunks_sent += 1
 
         except Exception as e:
             logger.error(f"TTS error: {e}")
@@ -347,23 +392,22 @@ class RealtimeHandler:
 
         producer.join(timeout=5)
 
-        await self._send_event(websocket, "response.audio.done", {
-            "response_id": response_id,
-            "item_id": item_id,
-        })
+        if not session.cancel_event.is_set():
+            await self._send_event(websocket, "response.audio.done", {
+                "response_id": response_id,
+                "item_id": item_id,
+            })
 
     def _tts_generate_streaming(self, session, text):
-        """VibeVoice generation as a generator — yields audio chunks as produced."""
+        """VibeVoice generation as a generator — yields audio chunks."""
         import copy
         import mlx.core as mx
 
         if self._tts_model is None:
             from mlx_vlm.tools.gemma4_audio.vibevoice_mlx import (
-                load_vibevoice, convert_voice_prompt, KVCache, StreamingCache,
-                TTS_TEXT_WINDOW_SIZE, TTS_SPEECH_WINDOW_SIZE,
+                load_vibevoice, convert_voice_prompt,
             )
             self._tts_model, self._tts_config = load_vibevoice()
-            # Find and load voice prompt
             import os
             voice_path = None
             candidates = [
@@ -383,14 +427,13 @@ class RealtimeHandler:
             self._tts_voice_prompt = convert_voice_prompt(voice_path)
 
         from mlx_vlm.tools.gemma4_audio.vibevoice_mlx import (
-            generate, KVCache, StreamingCache,
+            KVCache, StreamingCache,
             TTS_TEXT_WINDOW_SIZE, TTS_SPEECH_WINDOW_SIZE,
         )
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
 
-        # Build generation state from voice prompt
         def _restore_cache(kv_list):
             caches = []
             for k, v in kv_list:
@@ -418,17 +461,18 @@ class RealtimeHandler:
         i = 0
 
         while i < len(tokens):
+            if session.cancel_event.is_set():
+                return
+
             window = tokens[i:i + TTS_TEXT_WINDOW_SIZE]
             i += TTS_TEXT_WINDOW_SIZE
             is_last_window = (i >= len(tokens))
             text_ids = mx.array([window])
 
-            # Base LM
             cur_embeds = model.language_model.embed_tokens(text_ids)
             state["lm_hidden"] = model.language_model(inputs_embeds=cur_embeds, cache=state["lm_cache"])
             mx.eval(state["lm_hidden"])
 
-            # TTS LM
             tts_embeds = model.tts_language_model.embed_tokens(text_ids)
             splice_start = tts_embeds.shape[1] - state["lm_hidden"].shape[1]
             if splice_start > 0:
@@ -441,6 +485,9 @@ class RealtimeHandler:
             mx.eval(state["tts_lm_hidden"])
 
             for _ in range(TTS_SPEECH_WINDOW_SIZE):
+                if session.cancel_event.is_set():
+                    return
+
                 pos_cond = state["tts_lm_hidden"][:, -1:, :].reshape(1, -1)
                 neg_cond = state["neg_tts_lm_hidden"][:, -1:, :].reshape(1, -1)
 
@@ -457,7 +504,6 @@ class RealtimeHandler:
 
                 yield np.array(audio_chunk.reshape(-1), dtype=np.float32)
 
-                # Feed back
                 acoustic_embed = model.acoustic_connector(speech_latent.reshape(1, 1, -1))
                 type_embed_sp = model.tts_input_types(mx.zeros((1, 1), dtype=mx.int32))
                 tts_input = acoustic_embed + type_embed_sp
@@ -471,12 +517,10 @@ class RealtimeHandler:
                         return
 
     async def _send_event(self, websocket, event_type, data):
-        """Send a server event."""
         event = {"type": event_type, **data}
         await websocket.send_text(json.dumps(event))
 
     async def _send_error(self, websocket, code, message):
-        """Send an error event."""
         await self._send_event(websocket, "error", {
             "error": {"type": code, "message": message}
         })
