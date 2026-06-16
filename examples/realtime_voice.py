@@ -50,11 +50,7 @@ class RealtimeVoiceClient:
         self.last_voice_time = 0
         self.audio_chunks_received = 0
 
-        # Echo cancellation — ring buffer of output audio for subtraction
-        # Max 2s of output history at 24kHz, resampled to 16kHz for subtraction
-        self._echo_buf = np.zeros(0, dtype=np.float32)  # output samples at 16kHz
-        self._echo_write_time = None  # when we started writing to echo buf
-        self._echo_lock = None  # set in run()
+        self.first_audio_time = None
         self.first_audio_time = None
         self.response_text = ""
 
@@ -138,19 +134,6 @@ class RealtimeVoiceClient:
                     if self.first_audio_time is None:
                         self.first_audio_time = time.time()
 
-                    # Feed output audio into echo buffer (resample 24kHz → 16kHz)
-                    # Simple decimation: take every 1.5th sample (24000/16000)
-                    indices = np.arange(0, len(chunk_float), 24000 / 16000).astype(int)
-                    indices = indices[indices < len(chunk_float)]
-                    resampled = chunk_float[indices]
-                    if self._echo_write_time is None:
-                        self._echo_write_time = time.time()
-                    self._echo_buf = np.concatenate([self._echo_buf, resampled])
-                    # Keep max 4s of echo history
-                    max_echo = SAMPLE_RATE_IN * 4
-                    if len(self._echo_buf) > max_echo:
-                        self._echo_buf = self._echo_buf[-max_echo:]
-
             elif etype == "response.audio.truncated":
                 audio_end_ms = event.get("audio_end_ms", 0)
                 chunks = event.get("chunks_played", 0)
@@ -165,10 +148,6 @@ class RealtimeVoiceClient:
                 if status == "completed" and self.audio_chunks_received > 0:
                     duration = self.audio_chunks_received * 3200 / SAMPLE_RATE_OUT
                     print(f"[done] {duration:.1f}s audio")
-                # Clear echo buffer after response completes + drain time
-                await asyncio.sleep(1.0)  # wait for OS buffer to drain
-                self._echo_buf = np.zeros(0, dtype=np.float32)
-                self._echo_write_time = None
                 print()
                 print("Listening...", flush=True)
 
@@ -216,28 +195,17 @@ class RealtimeVoiceClient:
 
                 now = time.time()
 
-                # Echo cancellation: subtract known speaker output from mic input.
-                # We know what we sent to the speakers and approximately when.
-                # Estimate which part of the echo buffer corresponds to now,
-                # subtract it, then run VAD on the residual.
-                mic_for_vad = chunk_flat.copy()
+                # Echo gate: completely skip mic processing while the
+                # speaker is playing. Without hardware AEC, the mic picks
+                # up speaker output and Parakeet transcribes it as user
+                # input, poisoning conversation history.
+                # Trade-off: no barge-in during playback. Use headphones
+                # for barge-in support.
+                if self.is_responding:
+                    continue
 
-                if self._echo_write_time is not None and len(self._echo_buf) > 0:
-                    # Estimate echo delay: ~10ms acoustic + ~5ms buffer
-                    echo_delay_samples = int(SAMPLE_RATE_IN * 0.015)
-                    # How far into the echo buffer are we?
-                    elapsed_since_echo_start = now - self._echo_write_time
-                    echo_pos = int(elapsed_since_echo_start * SAMPLE_RATE_IN) - echo_delay_samples
-                    if echo_pos >= 0 and echo_pos + SILERO_CHUNK <= len(self._echo_buf):
-                        echo_segment = self._echo_buf[echo_pos:echo_pos + SILERO_CHUNK]
-                        # Subtract with a gain factor (echo is attenuated by distance)
-                        echo_gain = 0.7  # how much of the output reaches the mic
-                        mic_for_vad = chunk_flat - echo_gain * echo_segment
-                        # Clip to prevent artifacts
-                        mic_for_vad = np.clip(mic_for_vad, -1.0, 1.0)
-
-                # Run silero VAD on the echo-cancelled signal
-                chunk_tensor = torch.from_numpy(mic_for_vad).unsqueeze(0)
+                # Run silero VAD on mic input
+                chunk_tensor = torch.from_numpy(chunk_flat).unsqueeze(0)
                 speech_prob = vad_model(chunk_tensor, SAMPLE_RATE_IN).item()
                 voice_detected = speech_prob > self.vad_threshold
 
