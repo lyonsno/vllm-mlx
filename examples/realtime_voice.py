@@ -49,10 +49,21 @@ class RealtimeVoiceClient:
         self.speech_start_time = None
         self.last_voice_time = 0
         self.audio_chunks_received = 0
-
-        self.first_audio_time = None
         self.first_audio_time = None
         self.response_text = ""
+
+        # Acoustic Echo Cancellation — NLMS adaptive filter
+        # Keeps a buffer of recent speaker output and subtracts the
+        # estimated echo from mic input using an adaptive filter.
+        self._aec_filter_len = 512     # filter taps (~32ms at 16kHz)
+        self._aec_coeffs = np.zeros(self._aec_filter_len, dtype=np.float64)
+        self._aec_ref_buf = np.zeros(self._aec_filter_len, dtype=np.float64)
+        self._aec_mu = 0.3            # NLMS step size
+        self._aec_eps = 1e-8          # regularization
+        # Ring buffer of speaker output resampled to 16kHz
+        self._speaker_buf = np.zeros(0, dtype=np.float32)
+        self._speaker_write_time = None
+        self._speaker_total_written = 0
 
     async def run(self):
         try:
@@ -103,6 +114,48 @@ class RealtimeVoiceClient:
             self.out_stream.stop()
             self.out_stream.close()
 
+    def _nlms_cancel(self, mic_chunk: np.ndarray) -> np.ndarray:
+        """Apply NLMS adaptive filter to cancel speaker echo from mic input.
+
+        Uses the speaker output buffer as reference signal. Returns the
+        echo-cancelled signal (residual = user voice only).
+        """
+        out = np.zeros_like(mic_chunk, dtype=np.float64)
+        mic64 = mic_chunk.astype(np.float64)
+
+        for i in range(len(mic64)):
+            # Shift reference buffer and insert new speaker sample
+            # The reference is what we played ~15ms ago
+            ref_pos = self._speaker_total_written - len(self._speaker_buf)
+            # We need to figure out which speaker sample aligns with this mic sample
+            # For now, use the tail of the speaker buffer
+            if len(self._speaker_buf) > 0:
+                # Pop from the front of the speaker buffer as we consume it
+                if len(self._speaker_buf) > 0:
+                    ref_sample = float(self._speaker_buf[0])
+                    self._speaker_buf = self._speaker_buf[1:]
+                else:
+                    ref_sample = 0.0
+            else:
+                ref_sample = 0.0
+
+            # Shift reference into filter buffer
+            self._aec_ref_buf = np.roll(self._aec_ref_buf, 1)
+            self._aec_ref_buf[0] = ref_sample
+
+            # Estimate echo: y_hat = coeffs · ref_buf
+            y_hat = np.dot(self._aec_coeffs, self._aec_ref_buf)
+
+            # Error = mic - estimated echo (this is the user's voice)
+            e = mic64[i] - y_hat
+            out[i] = e
+
+            # NLMS update: coeffs += mu * e * ref_buf / (||ref_buf||^2 + eps)
+            norm = np.dot(self._aec_ref_buf, self._aec_ref_buf) + self._aec_eps
+            self._aec_coeffs += (self._aec_mu * e / norm) * self._aec_ref_buf
+
+        return np.clip(out, -1.0, 1.0).astype(np.float32)
+
     async def _receive_loop(self):
         """Receive and handle server events."""
         async for message in self.ws:
@@ -133,6 +186,13 @@ class RealtimeVoiceClient:
                     self.audio_chunks_received += 1
                     if self.first_audio_time is None:
                         self.first_audio_time = time.time()
+
+                    # Feed into AEC reference buffer (resample 24kHz → 16kHz)
+                    indices = np.arange(0, len(chunk_float), 1.5).astype(int)
+                    indices = indices[indices < len(chunk_float)]
+                    resampled = chunk_float[indices]
+                    self._speaker_buf = np.concatenate([self._speaker_buf, resampled])
+                    self._speaker_total_written += len(resampled)
 
             elif etype == "response.audio.truncated":
                 audio_end_ms = event.get("audio_end_ms", 0)
@@ -195,17 +255,15 @@ class RealtimeVoiceClient:
 
                 now = time.time()
 
-                # Echo gate: completely skip mic processing while the
-                # speaker is playing. Without hardware AEC, the mic picks
-                # up speaker output and Parakeet transcribes it as user
-                # input, poisoning conversation history.
-                # Trade-off: no barge-in during playback. Use headphones
-                # for barge-in support.
-                if self.is_responding:
-                    continue
+                # Echo cancellation: run NLMS adaptive filter to subtract
+                # speaker output from mic input before VAD
+                if len(self._speaker_buf) > 0 or np.any(self._aec_coeffs != 0):
+                    clean = self._nlms_cancel(chunk_flat)
+                else:
+                    clean = chunk_flat
 
-                # Run silero VAD on mic input
-                chunk_tensor = torch.from_numpy(chunk_flat).unsqueeze(0)
+                # Run silero VAD on echo-cancelled signal
+                chunk_tensor = torch.from_numpy(clean).unsqueeze(0)
                 speech_prob = vad_model(chunk_tensor, SAMPLE_RATE_IN).item()
                 voice_detected = speech_prob > self.vad_threshold
 
